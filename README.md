@@ -107,9 +107,55 @@ python Training/train.py --config configs/base_training.py
 3. 构造 Momentum Flow 的相空间训练状态 `y_t=(x_t,v_t)`。
 4. 在同一批训练状态上计算两个 loss：
    - `loss_r`：端点方向 MSE（只经过 `r_net`）
-   - `loss_s`：velocity score MSE（只经过 `score_net`）
+   - `loss_s`：NCSN 风格加权 velocity score MSE（只经过 `score_net`）
 5. 双 optimizer 各自独立 backward + gradient clip + step。
 6. 按 config 保存 checkpoint。
+
+两个网络的 loss 是分开反传和更新的。`r_net` 学习端点方向
+
+```text
+r = eps - x0
+```
+
+对应的训练目标是普通 MSE：
+
+```text
+L_r = E[ || r_theta(y_t, t, tau, e_p) - r ||_2^2 ].
+```
+
+`score_net` 学习 velocity-space 条件 score label。代码中先计算
+
+```text
+sigma_eff^2(t, tau) = Q_t - C_t^2 / S_t
+```
+
+并使用条件高斯下的 label：
+
+```text
+s_cond,v =
+    [ C_t (x_t - mu_x) - S_t (v_t - mu_v) ]
+    / [ S_t Q_t - C_t^2 ].
+```
+
+当前 `loss_s` 采用 batch 归一化后的 NCSN 风格权重。对第 `i` 个样本：
+
+```text
+w_i = sigma_eff,i^2 = Q_i - C_i^2 / S_i
+
+bar_w_i = w_i / ( (1 / B) * sum_{k=1}^B w_k )
+```
+
+最终训练用的 score loss 是
+
+```text
+L_s^weighted =
+    (1 / B) * sum_{i=1}^B
+    (1 / CHW) * sum_{j=1}^{CHW}
+    bar_w_i *
+    [ s_theta_v(y_ti, t_i, tau_i, e_pi)_j - s_cond,v,i,j ]^2.
+```
+
+这里加权的作用不是改变 `s_cond,v` 这个 label，而是让不同 `t,tau` 下的 score 误差进入 loss 时处在更接近的尺度上。代码仍会记录 `loss_s_unweighted`，用于观察未加权 score MSE 的对照值。
 
 checkpoint 默认保存在类似路径：
 
