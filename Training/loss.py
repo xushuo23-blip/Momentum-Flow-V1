@@ -10,15 +10,25 @@ def endpoint_direction_label(x0: Tensor, eps: Tensor) -> Tensor:
     return eps - x0
 
 
-def velocity_score_label(batch: dict[str, Tensor]) -> Tensor:
+def velocity_score_stats(batch: dict[str, Tensor], *, eps: float = 1e-12) -> dict[str, Tensor]:
+    x_t = batch["x_t"]
+    s_b = append_dims(batch["S"], x_t.ndim)
+    c_b = append_dims(batch["C"], x_t.ndim)
+    q_b = append_dims(batch["Q"], x_t.ndim)
+    sigma2_eff = (q_b - c_b.square() / s_b.clamp_min(eps)).clamp_min(eps)
+    det = (s_b * sigma2_eff).clamp_min(eps)
+    return {"sigma2_eff": sigma2_eff, "det": det}
+
+
+def velocity_score_label(batch: dict[str, Tensor], *, eps: float = 1e-12) -> Tensor:
     x_t = batch["x_t"]
     v_t = batch["v_t"]
     mu_x = batch["mu_x"]
     mu_v = batch["mu_v"]
     s_b = append_dims(batch["S"], x_t.ndim)
     c_b = append_dims(batch["C"], x_t.ndim)
-    q_b = append_dims(batch["Q"], x_t.ndim)
-    det = (s_b * q_b - c_b.square()).clamp_min(1e-12)
+    stats = velocity_score_stats(batch, eps=eps)
+    det = stats["det"]
     return (c_b * (x_t - mu_x) - s_b * (v_t - mu_v)) / det
 
 
@@ -26,8 +36,15 @@ def endpoint_direction_loss(pred_r: Tensor, target_r: Tensor) -> Tensor:
     return F.mse_loss(pred_r, target_r)
 
 
-def velocity_score_loss(pred_score: Tensor, target_score: Tensor) -> Tensor:
-    return F.mse_loss(pred_score, target_score)
+def velocity_score_loss(pred_score: Tensor, target_score: Tensor, sigma2_eff: Tensor) -> tuple[Tensor, Tensor]:
+    batch_size = pred_score.shape[0]
+    per_sample_loss = (pred_score - target_score).square().flatten(1).mean(dim=1)
+    unweighted_loss = per_sample_loss.mean()
+
+    weight = sigma2_eff.detach().reshape(batch_size, -1).mean(dim=1)
+    weight = weight / weight.mean().clamp_min(1e-12)
+    weighted_loss = (weight * per_sample_loss).mean()
+    return weighted_loss, unweighted_loss.detach()
 
 
 def compute_training_losses(
@@ -65,14 +82,18 @@ def compute_training_losses(
     )
 
     target_r = batch["r"]
+    score_stats = velocity_score_stats(batch)
     target_score = velocity_score_label(batch)
 
     loss_r = endpoint_direction_loss(pred_r, target_r)
-    loss_s = velocity_score_loss(pred_score, target_score)
+    loss_s, loss_s_unweighted = velocity_score_loss(pred_score, target_score, score_stats["sigma2_eff"])
 
     logs = {
-        "loss": (loss_r + loss_s).detach(),
         "loss_r": loss_r.detach(),
         "loss_s": loss_s.detach(),
+        "loss_s_unweighted": loss_s_unweighted,
+        "score_sigma2_eff_min": score_stats["sigma2_eff"].detach().amin(),
+        "score_sigma2_eff_mean": score_stats["sigma2_eff"].detach().mean(),
+        "score_det_min": score_stats["det"].detach().amin(),
     }
     return loss_r, loss_s, logs
